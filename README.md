@@ -42,6 +42,12 @@ The host places them from the spawn menu (Creatures > Silkmaw (Acidica), (Ignitu
 ## With Living Humans
 If the [Living Humans](https://steamcommunity.com/sharedfiles/filedetails/?id=3823255433) mod is on, the centipedes hunt its people too: they are dragged off and cocooned, and the juveniles feed on them. A friendly Machina counts as one of the humans.
 
+## With AI Villagers of Dunmarrow
+If [AI Villagers of Dunmarrow](https://steamcommunity.com/sharedfiles/filedetails/?id=3840579200) is on, the centipedes hunt the villagers exactly as they hunt players: spit, lunges, quakes and pulses hit them, they are dragged to the nest and spun into cocoons, and a player can cut them free with E. The villagers see the centipedes, fear them and run, and they can fight back. They like a friendly Clockwork Machina, until one of them hurts it.
+
+## With the McPuppet Inventory System
+If the [McPuppet Inventory System](https://steamcommunity.com/sharedfiles/filedetails/?id=3840357667) is on, a dead centipede drops gold to pick up: 300 for an Acidica, 350 for an Ignitus, 400 for a Clockwork Machina, 350 to 500 for a Seismica (the bigger the more) and 30 for a juvenile.
+
 ## Multiplayer
 The host turns it on under Global mods. Each player's game draws the bodies itself; the host runs the brains.
 
