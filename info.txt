@@ -1,0 +1,6 @@
+name = Giant Centipedes
+author = plasticroyal and AgeOfAlgorithms
+description = Four kinds of 12 m centipedes that crawl over floors, walls and ceilings, spin silk nests, drag their prey home into cocoons and fight each other for ground. Acidica (the Silkmaw) spits acid; Ignitus is fireproof and spits fire; the Clockwork Machina hunts the other kinds and leaves people alone until someone hurts it; the Seismica grows to twice its size and shakes the ground apart. Left alone they lay eggs, and the juveniles grow up to build nests of their own. The host places them from the spawn menu (Creatures / Silkmaw); one comes out of the marker after 7 seconds. Ideas and kinds by plasticroyal, built on Abyssipede; code optimized by AgeOfAlgorithms.
+tags = Gameplay
+version = 2
+preview = preview_td.jpg

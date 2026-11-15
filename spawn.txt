@@ -1,0 +1,4 @@
+prefab/spawner.xml : Creatures/Silkmaw (Acidica)
+prefab/spawner_ignitus.xml : Creatures/Silkmaw (Ignitus)
+prefab/spawner_machina.xml : Creatures/Silkmaw (Clockwork Machina)
+prefab/spawner_seismica.xml : Creatures/Silkmaw (Seismica)
