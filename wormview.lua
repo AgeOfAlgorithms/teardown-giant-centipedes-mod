@@ -1086,9 +1086,10 @@ function WormView.clientTick(dt)
 				else
 					PointLight(VecAdd(np, Vec(0, 0.8, 0)), 0.92, 0.96, 0.94, 0.75 * nestPulse)
 				end
-				-- Performant low-lying ground fog that scales in radius and density with nest expansion tier (1..5)
+				-- Performant low-lying ground fog that scales in radius and density with nest expansion tier (1..6; bigger nests keep
+				-- the 6-ring fog: its particles stay the same however far the silk reaches)
 				if emitFog and dist(wvCam, np) < 85 then
-					local tier = math.max(1, math.min(5, ns.tier or 1))
+					local tier = math.max(1, math.min(6, ns.tier or 1))
 					local fogR = 4.8 * (0.75 + 0.25 * tier)
 					local alpha0 = math.min(0.34, 0.09 + 0.048 * tier)
 					local puffs = 1 + math.floor(tier * 0.6)

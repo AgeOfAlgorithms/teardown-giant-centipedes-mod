@@ -89,7 +89,9 @@ SEIS_GROW_T = 150.0
 SEIS_GROW_STEP = 0.25
 SEIS_GROW_STAGES = 4
 SEIS_SLOW = 0.2              -- speed / (1 + SEIS_SLOW * step): 1.8x slower at full size, as in the pack
-NEST_MAX_TIER = 3             -- the nest grows a ring on a return visit, up to 3 rings (each ring is ~250 shapes every client gets)
+NEST_MAX_TIER = 10            -- the nest grows a ring on a return visit, up to 10 rings (rings are cheap since 1.2: grown over
+                              -- frames, repaired piece by piece, painted into few shapes - NEST_PAINT). The options menu sets
+                              -- 3 to 10 (savegame.mod.nestrings, read by the host in Worm.serverInit; 0 = not set = 10)
 NEST_BUILD_DURATION = 15.0    -- s the centipede spends spraying its 6-layer silk vein network across surfaces
 NEST_BUILD_STAGES = 6         -- 6 progressive layers of silk veins & webbing built up on surfaces
 NEST_REPAIR_DURATION = 4.5    -- s the centipede spends spraying fresh silk to repair a damaged nest
@@ -689,7 +691,7 @@ end
 -- Checks if a point is close to any active nest so the centipede's own bites/acid never damage its nest
 function wormNearAnyNest(p, rad)
 	for _, ns in ipairs(wormNests) do
-		local r = rad or (NEST_RADIUS * (ns.tier or 1) + 1.0)
+		local r = rad or ((ns.extent or NEST_RADIUS) + 1.0)
 		if dist(p, ns.pos) < r then return true end
 	end
 	return false
@@ -736,6 +738,8 @@ function wormNestDeleteBodies(w)
 	end
 	w.nestBody = 0
 	w.nestIntegT = nil
+	w.nestPieces = {}
+	w.nestGrow = nil
 end
 
 -- Returns the nest's current structural integrity ratio (0.0 to 1.0) combining voxel count and structural HP.
@@ -748,7 +752,7 @@ function wormNestIntegrity(w)
 	local v = 0
 	local curVox, ok = wormNestBodiesState(w.nestBodies)
 	if ok then
-		local initVox = math.max(100, w.nestInitVox or 100)
+		local initVox = math.max(100, wormNestInitVox(w))
 		local voxRatio = curVox / initVox
 		local maxHp = w.nestMaxHp or NEST_MAX_HP
 		local hpRatio = math.max(0, (w.nestHp or maxHp) / maxHp)
@@ -890,6 +894,7 @@ local function wormAddSilkSurfaceBox(segList, baseP, p0, p1, surfNorm, wVox, hVo
 		localPos = localCorner,
 		midWorld = VecLerp(p0, p1, 0.5),
 		norm = n,
+		p0 = VecCopy(p0), p1 = VecCopy(p1),
 	}
 end
 
@@ -926,7 +931,7 @@ end
 function wormTraceSilkNetwork(baseP, variant)
 	local segList = {}
 	local silkFloorNodes = { {pos = VecCopy(baseP), norm = Vec(0, 1, 0)} }
-	local numArteries = 14
+	local numArteries = NEST_SPOKES
 	local stepsPerArtery = 8
 	local stepLen = 0.68 -- 8 * 0.68m = ~5.45m radius (~11m diameter)
 
@@ -940,7 +945,7 @@ function wormTraceSilkNetwork(baseP, variant)
 		wormAddSilkSurfaceBox(segList, baseP, p0, p1, Vec(0, 1, 0), 2, 2, wormSilkShade(0.96, 0.99, 0.95, i * 13, 0.020, variant), true,  1)
 	end
 
-	-- 2. Trace 14 primary arterial veins radiating outward across floor, walls, and ceiling
+	-- 2. Trace NEST_SPOKES (10; the pack: 14) primary arterial veins radiating outward across floor, walls, and ceiling
 	local arteries = {}
 	for a = 1, numArteries do
 		local angBase = ((a - 0.5) / numArteries) * 6.283185
@@ -1068,159 +1073,276 @@ function wormTraceSilkNetwork(baseP, variant)
 	return segList, silkFloorNodes, arteryTips
 end
 
--- Traces one expansion ring (tier 2..5) continuing seamlessly from the outer artery tips of the previous tier.
--- Returns ONLY the new ring's segments, new floor nodes, and updated artery tips so existing nest bodies are never recreated.
-function wormTraceSilkExpansionTier(baseP, tier, prevTips, variant)
-	local segList = {}
-	local silkFloorNodes = {}
-	local numArteries = 14
-	local stepsPerTier = 8
-	local stepLen = 0.68
-	local newTips = {}
-	local arteries = {}
+-- One expansion ring (tier 2..NEST_MAX_TIER), traced a few strands a frame (wormNestGrowStep) and spawned as one piece
+-- when done (the pack traced a whole ring in one frame, ~410 engine queries, and spawned ~235 shapes at once). The nest
+-- grows like a plant, not a wheel: of its open tips (ring 1's NEST_SPOKES spoke ends, then every branch end) only
+-- RING_GROW_TIPS are picked each ring and grow a branch; some branches fork, and the fork's end is a new open tip.
+-- Tips not picked wait for a later ring. So every ring costs the same, however many rings there are.
+NEST_SPOKES = 12              -- spokes of ring 1 (the pack: 14)
+RING_GROW_TIPS = 6            -- tips that grow a branch each ring
+RING_STEPS = 5                -- strips along each branch (the pack: 8 of 0.68 m)
+RING_STEP_LEN = 1.1           -- m per strip
+RING_FORK_P = 0.5             -- chance that a branch forks (after RING_FORK_AT strips) into a second, shorter one
+RING_FORK_AT = 3
+RING_FORK_STEPS = 3
+RING_FORK_LEN = 1.0
+RING_CROSS_R = 4.0            -- two new branches whose middles are this close get a strand of webbing between them
+RING_LADDER_R = 3.2           -- ...and a few straight threads between their nodes this close (web ladders, no queries)
+RING_HAIRS = 2                -- fine threads off each strip of a branch (alternating sides; drawn into the same shapes)
+RING_HAIR_LEN = 0.75          -- m
+RING_MAX_TIPS = 40            -- open tips kept (the innermost go first)
+GROW_BRANCHES_PER_STEP = 2    -- branches traced per frame
 
-	for a = 1, numArteries do
-		local startNode = (prevTips and prevTips[a])
-		if not startNode then
-			local angBase = ((a - 0.5) / numArteries) * 6.283185
-			local dir = Vec(math.cos(angBase), 0, math.sin(angBase))
-			startNode = {pos = VecAdd(baseP, VecScale(dir, (tier - 1) * NEST_RADIUS * 0.85)), norm = Vec(0, 1, 0), dir = dir}
-		end
-		local curP, curN, curDir = startNode.pos, startNode.norm, startNode.dir
-		arteries[a] = { {pos = curP, norm = curN, dir = curDir} }
-
-		for s = 1, stepsPerTier do
-			local side = VecNormalize(VecCross(curN, curDir))
-			local wave = math.sin(a * 2.1 + (s + tier * 8) * 1.15) * 0.24
-			local steerDir = VecNormalize(VecAdd(curDir, VecScale(side, wave)))
-			local nxtP, nxtN, nxtDir = wormStepSurfaceVein(curP, curN, steerDir, stepLen)
-			if not nxtP then break end
-
-			arteries[a][s + 1] = {pos = nxtP, norm = nxtN, dir = nxtDir}
-			if nxtN[2] > 0.55 then
-				silkFloorNodes[#silkFloorNodes + 1] = {pos = VecCopy(nxtP), norm = VecCopy(nxtN)}
-			end
-
-			local hVox = (s <= 4) and 2 or 1
-			local wVox = (s <= 2) and 3 or 2
-			local col = wormSilkShade(0.93, 0.97, 0.92, tier * 131 + a * 31 + s * 11, 0.030, variant)
-			wormAddSilkSurfaceBox(segList, baseP, curP, nxtP, nxtN, wVox, hVox, col, s <= 3, 6)
-			curP, curN, curDir = nxtP, nxtN, nxtDir
-		end
-		newTips[a] = arteries[a][#arteries[a]]
+-- the open tips: picks RING_GROW_TIPS of them, the ones nearest the middle first (with some chance for the others),
+-- so the nest fills in round its middle instead of running out in long tendrils (seen in-game when the outer tips won)
+RING_SHORT_BIAS = 1.2         -- added to a tip's random 0..1 score: all of it at the middle, none at the outermost tip
+local function pickTips(tips, baseP, n)
+	local far = 0.1
+	for _, t in ipairs(tips) do far = math.max(far, dist(t.pos, baseP)) end
+	local pool = {}
+	for i, t in ipairs(tips) do
+		pool[#pool + 1] = {i = i, w = math.random() + RING_SHORT_BIAS * (1 - dist(t.pos, baseP) / far)}
 	end
-
-	-- Bifurcating side veins along the new expansion ring
-	for a = 1, numArteries do
-		local chain = arteries[a]
-		for _, branchStep in ipairs({3, 6}) do
-			local node = chain[branchStep]
-			if node then
-				local sign = ((a + tier) % 2 == 0) and 1 or -1
-				local side = VecNormalize(VecCross(node.norm, node.dir))
-				local bDir = VecNormalize(VecAdd(VecScale(node.dir, 0.76), VecScale(side, 0.64 * sign)))
-				local bP, bN = node.pos, node.norm
-				for bs = 1, 3 do
-					local nP, nN, nD = wormStepSurfaceVein(bP, bN, bDir, 0.62)
-					if not nP then break end
-					local col = wormSilkShade(0.90, 0.95, 0.88, tier * 97 + a * 53 + bs, 0.032, variant)
-					wormAddSilkSurfaceBox(segList, baseP, bP, nP, nN, 2, (bs == 1) and 2 or 1, col, bs == 1, 6)
-					if nN[2] > 0.55 then
-						silkFloorNodes[#silkFloorNodes + 1] = {pos = VecCopy(nP), norm = VecCopy(nN)}
-					end
-					bP, bN, bDir = nP, nN, nD
-				end
-			end
-		end
-	end
-
-	-- Cross-veins and silk membrane webbing across the expansion ring
-	for _, ringStep in ipairs({3, 6}) do
-		for a = 1, numArteries do
-			local aNext = (a % numArteries) + 1
-			local n1 = arteries[a] and arteries[a][ringStep]
-			local n2 = arteries[aNext] and arteries[aNext][ringStep]
-			if n1 and n2 and dist(n1.pos, n2.pos) < 3.6 * tier then
-				local midP = VecLerp(n1.pos, n2.pos, 0.5)
-				wormFilter()
-				local cpHit, cpPt, cpNorm = QueryClosestPoint(midP, 0.75)
-				if cpHit and cpPt and cpNorm then
-					local col = wormSilkShade(0.89, 0.94, 0.87, tier * 71 + a * 41 + ringStep, 0.030, variant)
-					wormAddSilkSurfaceBox(segList, baseP, n1.pos, cpPt, cpNorm, 2, 1, col, false, 6)
-					wormAddSilkSurfaceBox(segList, baseP, cpPt, n2.pos, cpNorm, 2, 1, col, false, 6)
-					if cpNorm[2] > 0.55 then
-						silkFloorNodes[#silkFloorNodes + 1] = {pos = VecCopy(cpPt), norm = VecCopy(cpNorm)}
-					end
-				end
-			end
-		end
-	end
-
-	return segList, silkFloorNodes, newTips
+	table.sort(pool, function(x, y) return x.w > y.w end)
+	local out = {}
+	for k = 1, math.min(n, #pool) do out[k] = pool[k].i end
+	return out
 end
 
--- Expands the nest by one tier (up to NEST_MAX_TIER = 5x original size) by spawning a single static body for the new outer ring
-function wormExpandSilkNest(w)
-	if not w.nestBuilt or not w.nestTr or not w.nestPos then return false end
-	local curTier = w.nestTier or 1
-	if curTier >= NEST_MAX_TIER then return false end
-	local nextTier = curTier + 1
+function wormNestGrowStart(w, tier)
+	local tips = {}
+	for _, t in ipairs(w.nestArteryTips or {}) do tips[#tips + 1] = t end
 	local baseP = w.nestTr.pos
-	local newSegs, newNodes, newTips = wormTraceSilkExpansionTier(baseP, nextTier, w.nestArteryTips, w.variant)
-	w.nestTier = nextTier
-	w.nestArteryTips = newTips
-	w.nestSegs = w.nestSegs or {}
-	for _, seg in ipairs(newSegs) do w.nestSegs[#w.nestSegs + 1] = seg end
-	w.nestSilkNodes = w.nestSilkNodes or {}
-	for _, nd in ipairs(newNodes) do w.nestSilkNodes[#w.nestSilkNodes + 1] = nd end
-
-	if #newSegs > 0 then
-		local nestMat = "plaster"                                 -- (every kind: rock left Ignitus nests all but unbreakable)
-		local parts = {"<body tags='silkmawnest nocull' dynamic='false'>"}
-		for idx, seg in ipairs(newSegs) do
-			local glowTag = seg.isGlow and " nestglow" or ""
-			parts[#parts + 1] = string.format(
-				"<voxbox tags='nocull%s sv=%d' material='" .. nestMat .. "' pos='%.3f %.3f %.3f' size='%d %d %d' color='%s'/>",
-				glowTag, idx, seg.localPos[1], seg.localPos[2], seg.localPos[3],
-				seg.wVox, seg.hVox, seg.lVox, seg.col
-			)
+	if #tips == 0 then                                         -- (no tips kept: spokes from the middle)
+		for a = 1, NEST_SPOKES do
+			local ang = ((a - 0.5) / NEST_SPOKES) * 6.283185
+			local dir = Vec(math.cos(ang), 0, math.sin(ang))
+			tips[a] = {pos = VecAdd(baseP, VecScale(dir, NEST_RADIUS * 0.85)), norm = Vec(0, 1, 0), dir = dir}
 		end
-		parts[#parts + 1] = "</body>"
-		local ents = Spawn(table.concat(parts), w.nestTr, true)
-		for _, e in ipairs(ents or {}) do
-			if GetEntityType(e) == "body" then
-				SetTag(e, "nocull")
-				SetBodyDynamic(e, false)
-				SetBodyTransform(e, w.nestTr)
-				for _, sh in ipairs(GetBodyShapes(e)) do
-					SetTag(sh, "nocull")
-					local sIdx = tonumber(GetTagValue(sh, "sv"))
-					if sIdx and newSegs[sIdx] then
-						SetShapeLocalTransform(sh, newSegs[sIdx].localTr)
-					end
-					SetShapeCollisionFilter(sh, WORM_LAYER, 255 - WORM_LAYER)
-					SetShapeEmissiveScale(sh, HasTag(sh, "nestglow") and 0.24 or 0.08)
-					wormNestShapes[sh] = w
+	end
+	return {tier = tier, baseP = baseP, variant = w.variant, phase = "branches", k = 1, sk = 1, segs = {}, nodes = {},
+		tips = tips, pick = pickTips(tips, baseP, RING_GROW_TIPS), grown = {}, newTips = {}, used = {},
+		oldNodes = w.nestSilkNodes or {}, extent = w.nestExtent or NEST_RADIUS}
+end
+
+-- one strand of silk from a node: n strips of len m, wandering a little; returns its chain of nodes
+local function growStrand(g, node, dir, n, len, thick, seed)
+	local curP, curN, curDir = node.pos, node.norm, dir
+	local chain = { {pos = curP, norm = curN, dir = curDir} }
+	for s = 1, n do
+		local side = VecNormalize(VecCross(curN, curDir))
+		local wave = math.sin(seed * 2.1 + (s + g.tier * 8) * 1.15) * 0.24
+		local nxtP, nxtN, nxtDir = wormStepSurfaceVein(curP, curN, VecNormalize(VecAdd(curDir, VecScale(side, wave))), len)
+		if not nxtP then break end
+		chain[#chain + 1] = {pos = nxtP, norm = nxtN, dir = nxtDir}
+		if nxtN[2] > 0.55 then g.nodes[#g.nodes + 1] = {pos = VecCopy(nxtP), norm = VecCopy(nxtN)} end
+		local col = wormSilkShade(0.93, 0.97, 0.92, g.tier * 131 + seed * 31 + s * 11, 0.030, g.variant)
+		wormAddSilkSurfaceBox(g.segs, g.baseP, curP, nxtP, nxtN, (thick and s <= 1) and 3 or 2, (thick and s <= 2) and 2 or 1,
+			col, thick and s <= 2, 6)
+		for hk = 1, RING_HAIRS do                              -- (fine threads off the strand: fuller, no engine queries)
+			local sgn = ((s + hk + seed) % 2 == 0) and 1 or -1
+			local at = VecLerp(curP, nxtP, (hk - 0.5) / RING_HAIRS)
+			local hl = RING_HAIR_LEN * (0.6 + 0.4 * math.random())
+			local hd = VecNormalize(VecAdd(VecScale(nxtDir, 0.55), VecScale(side, 0.83 * sgn)))
+			local hcol = wormSilkShade(0.90, 0.95, 0.89, g.tier * 37 + seed * 17 + s * 7 + hk, 0.035, g.variant)
+			wormAddSilkSurfaceBox(g.segs, g.baseP, at, VecAdd(at, VecScale(hd, hl)), nxtN, 1, 1, hcol, false, 6)
+		end
+		curP, curN, curDir = nxtP, nxtN, nxtDir
+	end
+	return chain
+end
+
+-- grows the k-th picked tip: a branch outward, maybe a fork; the branch's end (and the fork's) become open tips
+local function growBranch(g, k)
+	local ti = g.pick[k]
+	local tip = g.tips[ti]
+	if not tip then return end
+	g.used[ti] = true
+	local out = VecSub(tip.pos, g.baseP)
+	out[2] = 0
+	out = VecLength(out) > 0.3 and VecNormalize(out) or tip.dir
+	local dir = VecNormalize(VecAdd(VecScale(tip.dir, 0.6), VecScale(out, 0.4)))   -- (onward, bent outward)
+	local chain = growStrand(g, tip, dir, RING_STEPS, RING_STEP_LEN, true, ti)
+	if #chain < 2 then g.newTips[#g.newTips + 1] = tip; return end   -- (nowhere to go: stays open)
+	g.grown[#g.grown + 1] = chain
+	g.newTips[#g.newTips + 1] = chain[#chain]
+	local fn = chain[math.min(#chain, RING_FORK_AT + 1)]
+	if #chain > RING_FORK_AT and math.random() < RING_FORK_P then
+		local side = VecNormalize(VecCross(fn.norm, fn.dir))
+		local sign = (math.random() < 0.5) and 1 or -1
+		local fDir = VecNormalize(VecAdd(VecScale(fn.dir, 0.76), VecScale(side, 0.64 * sign)))
+		local fork = growStrand(g, fn, fDir, RING_FORK_STEPS, RING_FORK_LEN, false, ti + 50)
+		if #fork >= 2 then g.newTips[#g.newTips + 1] = fork[#fork] end
+	end
+end
+
+-- Sprouts: besides the tips, a ring may start a new branch off silk already laid, into the barest side round it, so
+-- gaps between the branches fill in. A few old silk nodes are looked at; round each, the silk within RING_SPROUT_R is
+-- counted in 8 directions along its surface (Lua only, no engine queries) and the emptiest direction wins, the more
+-- so if the sprout stays inside the nest (outward is always bare at the edge; the tips already grow outward).
+RING_SPROUTS = 2              -- tries per ring
+RING_SPROUT_P = 0.6           -- chance of each try
+RING_SPROUT_STEPS = 4         -- strips of a sprout (RING_STEP_LEN each)
+RING_SPROUT_R = 3.0           -- m: silk round a node counted to find its bare side
+RING_SPROUT_LOOKS = 10        -- old nodes looked at per sprout
+RING_SPROUT_FULL = 4          -- a side with this much silk (weighted count) is not bare: no sprout there
+local function sproutBranch(g, k)
+	local pool = g.oldNodes
+	if #pool == 0 or math.random() >= RING_SPROUT_P then return end
+	local lists = {pool, g.nodes, g.tips, g.newTips}
+	local reach = RING_SPROUT_STEPS * RING_STEP_LEN
+	local best, bestS, bestDir = nil, 1e9, nil
+	for _ = 1, RING_SPROUT_LOOKS do
+		local c = pool[math.random(#pool)]
+		local n = c.norm
+		local t1 = VecCross(n, Vec(0, 0, 1))
+		if VecLength(t1) < 0.2 then t1 = VecCross(n, Vec(1, 0, 0)) end
+		t1 = VecNormalize(t1)
+		local t2 = VecCross(n, t1)
+		local bins = {0, 0, 0, 0, 0, 0, 0, 0}
+		for _, list in ipairs(lists) do
+			for _, o in ipairs(list) do
+				local d = VecSub(o.pos, c.pos)
+				local l = VecLength(d)
+				if l > 0.3 and l < RING_SPROUT_R then
+					local a = math.atan2(VecDot(d, t2), VecDot(d, t1))
+					local b = math.floor(a / 6.283185 * 8 + 8.5) % 8 + 1
+					bins[b] = bins[b] + 1
 				end
-				w.nestBodies = w.nestBodies or {}
-				w.nestBodies[#w.nestBodies + 1] = e
+			end
+		end
+		for b = 1, 8 do
+			local s = bins[b] + 0.5 * (bins[(b % 8) + 1] + bins[((b + 6) % 8) + 1])
+			if s < RING_SPROUT_FULL then
+				local ang = (b - 1) / 8 * 6.283185
+				local dir = VecAdd(VecScale(t1, math.cos(ang)), VecScale(t2, math.sin(ang)))
+				local over = dist(VecAdd(c.pos, VecScale(dir, reach)), g.baseP) - g.extent   -- (past the nest's edge)
+				s = s + math.max(0, over) * 0.8 + math.random() * 0.6
+				if s < bestS then best, bestS, bestDir = c, s, dir end
 			end
 		end
 	end
-	w.nestMaxHp = NEST_MAX_HP                                  -- (the same 300 at any size: as easy to wreck as 1.0.3's)
-	w.nestHp = w.nestMaxHp
-	w.nestInitVox = math.max(100, (wormNestBodiesState(w.nestBodies)))
-	w.nestIntegT = nil
-	w.repairingNestUntil = now() + 2.0
-	w.mouth = 0.9
-	w.ev.spit = (w.ev.spit or 0) + 1
-	w.ev.hiss = w.ev.hiss + 1
-	for _, ns in ipairs(wormNests) do
-		if ns.owner == w.id then
-			ns.bodies = w.nestBodies
-			ns.initVox = w.nestInitVox
-			ns.tier = nextTier
-			ns.repairing = true
+	if not best then return end
+	local chain = growStrand(g, best, bestDir, RING_SPROUT_STEPS, RING_STEP_LEN, false, 200 + k * 13)
+	if #chain < 2 then return end
+	g.grown[#g.grown + 1] = chain
+	g.newTips[#g.newTips + 1] = chain[#chain]
+	g.sprouts = (g.sprouts or 0) + 1
+end
+
+-- webbing between new branches that run close to each other
+local function growCross(g)
+	for i = 1, #g.grown do
+		for j = i + 1, #g.grown do
+			local c1, c2 = g.grown[i], g.grown[j]
+			local n1, n2 = c1[math.ceil(#c1 / 2) + 1] or c1[#c1], c2[math.ceil(#c2 / 2) + 1] or c2[#c2]
+			if dist(n1.pos, n2.pos) < RING_CROSS_R then
+				wormFilter()
+				local cpHit, cpPt, cpNorm = QueryClosestPoint(VecLerp(n1.pos, n2.pos, 0.5), 0.75)
+				if cpHit and cpPt and cpNorm then
+					local col = wormSilkShade(0.89, 0.94, 0.87, g.tier * 71 + i * 41 + j, 0.030, g.variant)
+					wormAddSilkSurfaceBox(g.segs, g.baseP, n1.pos, cpPt, cpNorm, 2, 1, col, false, 6)
+					wormAddSilkSurfaceBox(g.segs, g.baseP, cpPt, n2.pos, cpNorm, 2, 1, col, false, 6)
+					if cpNorm[2] > 0.55 then g.nodes[#g.nodes + 1] = {pos = VecCopy(cpPt), norm = VecCopy(cpNorm)} end
+				end
+			end
+			local rungs = 0
+			for k = 2, math.min(#c1, #c2) do                   -- (rungs between matching nodes on the same surface)
+				local a, b = c1[k], c2[k]
+				if rungs < 3 and dist(a.pos, b.pos) < RING_LADDER_R and VecDot(a.norm, b.norm) > 0.9 then
+					local col = wormSilkShade(0.88, 0.93, 0.86, g.tier * 53 + i * 19 + j * 7 + k, 0.035, g.variant)
+					wormAddSilkSurfaceBox(g.segs, g.baseP, a.pos, b.pos, a.norm, 1, 1, col, false, 6)
+					rungs = rungs + 1
+				end
+			end
+		end
+	end
+end
+
+-- the tips after a ring: the ones not picked, then the new branch ends; the innermost go if there are too many
+local function nextTips(g)
+	local all = {}
+	for i, t in ipairs(g.tips) do if not g.used[i] then all[#all + 1] = t end end
+	for _, t in ipairs(g.newTips) do all[#all + 1] = t end
+	if #all > RING_MAX_TIPS then
+		table.sort(all, function(x, y) return dist(x.pos, g.baseP) > dist(y.pos, g.baseP) end)
+		for i = #all, RING_MAX_TIPS + 1, -1 do all[i] = nil end
+	end
+	return all
+end
+
+-- how far the nest's silk reaches from its middle (checks round the nest use it, not the ring count)
+function wormNestExtent(w)
+	local c = (w.nestTr and w.nestTr.pos) or w.nestPos
+	if not c then return NEST_RADIUS end
+	local r = NEST_RADIUS
+	for _, nd in ipairs(w.nestSilkNodes or {}) do r = math.max(r, dist(nd.pos, c)) end
+	for _, t in ipairs(w.nestArteryTips or {}) do r = math.max(r, dist(t.pos, c)) end
+	return r
+end
+
+-- one frame's share of a growing ring; spawns it and finishes when done
+function wormNestGrowStep(w)
+	local g = w.nestGrow
+	if not g then return end
+	if not w.nestBuilt or not w.nestTr then w.nestGrow = nil; return end   -- (the nest was destroyed meanwhile)
+	if g.phase == "branches" then
+		for _ = 1, GROW_BRANCHES_PER_STEP do
+			if g.k > #g.pick then break end
+			growBranch(g, g.k)
+			g.k = g.k + 1
+		end
+		if g.k > #g.pick then g.phase = "sprouts" end
+	elseif g.phase == "sprouts" then                               -- (one a frame)
+		if g.sk <= RING_SPROUTS then sproutBranch(g, g.sk) end
+		g.sk = g.sk + 1
+		if g.sk > RING_SPROUTS then g.phase = "cross" end
+	elseif g.phase == "cross" then
+		growCross(g)
+		g.phase = "spawn"
+	else
+		w.nestGrow = nil
+		w.nestTier = g.tier
+		w.nestArteryTips = nextTips(g)
+		w.nestSprouts = (w.nestSprouts or 0) + (g.sprouts or 0)    -- (counted for the tests)
+		w.nestSegs = w.nestSegs or {}
+		for _, seg in ipairs(g.segs) do w.nestSegs[#w.nestSegs + 1] = seg end
+		w.nestSilkNodes = w.nestSilkNodes or {}
+		for _, nd in ipairs(g.nodes) do w.nestSilkNodes[#w.nestSilkNodes + 1] = nd end
+		wormNestSpawnPiece(w, "r" .. g.tier, g.segs)
+		w.nestExtent = wormNestExtent(w)
+		w.nestMaxHp = NEST_MAX_HP                              -- (the same 300 at any size: as easy to wreck as 1.0.3's)
+		w.nestHp = w.nestMaxHp
+		w.nestIntegT = nil
+		w.repairingNestUntil = now() + 2.0
+		for _, ns in ipairs(wormNests) do
+			if ns.owner == w.id then
+				ns.bodies = w.nestBodies
+				ns.tier = g.tier
+				ns.extent = w.nestExtent
+				ns.repairing = true
+			end
+		end
+	end
+end
+
+-- Grows the nest by one ring (up to NEST_MAX_TIER): started here, traced over the next frames (wormNestGrowStep).
+-- instant = true: all of it now (tests).
+function wormExpandSilkNest(w, instant)
+	if not w.nestBuilt or not w.nestTr or not w.nestPos then return false end
+	if not w.nestGrow then
+		if (w.nestTier or 1) >= NEST_MAX_TIER then return false end
+		w.nestGrow = wormNestGrowStart(w, (w.nestTier or 1) + 1)
+		w.mouth = 0.9
+		w.ev.spit = (w.ev.spit or 0) + 1
+		w.ev.hiss = w.ev.hiss + 1
+	elseif not instant then
+		return false
+	end
+	if instant then
+		for _ = 1, 64 do
+			if not w.nestGrow then break end
+			wormNestGrowStep(w)
 		end
 	end
 	return true
@@ -1234,7 +1356,7 @@ function wormPickSilkSurfacePos(w, minDistFromCenter, maxDistFromCenter)
 		local valid = {}
 		for _, nd in ipairs(nodes) do
 			local d = dist(nd.pos, baseP)
-			local maxR = maxDistFromCenter or (NEST_RADIUS * (w.nestTier or 1))
+			local maxR = maxDistFromCenter or (w.nestExtent or NEST_RADIUS)
 			if d >= (minDistFromCenter or 0.0) and d <= maxR then
 				valid[#valid + 1] = nd
 			end
@@ -1249,57 +1371,193 @@ function wormPickSilkSurfacePos(w, minDistFromCenter, maxDistFromCenter)
 	return VecCopy(baseP), Vec(0, 1, 0)
 end
 
--- Spawns (or updates at a given layer stage 1..6) the procedural surface-sprayed silk vein network
--- (only = true: just the segments that layer adds, as a body of its own - the layers before it stay as they are,
--- instead of the whole nest being deleted and spawned again for every layer; 0 when the layer adds nothing)
-function wormSpawnNestBody(w, baseP, stage, only)
-	local st = stage or NEST_BUILD_STAGES
-	if not w.nestSegs or not w.nestSilkNodes then
-		w.nestSegs, w.nestSilkNodes, w.nestArteryTips = wormTraceSilkNetwork(baseP, w.variant)
+-- A nest is made of PIECES (w.nestPieces[key] = {i, segs, initVox, spawnT}): ring 1's six build layers ("s1".."s6") and
+-- every outer ring ("r2".."r5"), each its own body in w.nestBodies (at index i). A repair resprays only the pieces
+-- that lost silk (the pack resprayed the whole nest: ~1,300 shapes to every client at 5 rings). No "nocull" on nest
+-- silk: far away the engine may fade it like any small thing.
+NEST_PAINT = true             -- the silk painted into a few shapes per piece (wormPaintSilkBody); false: one voxbox per strip
+
+-- the segments of ring 1's build layer st
+function wormNestStageSegs(w, st)
+	local out = {}
+	for _, seg in ipairs(w.nestSegs or {}) do
+		if not seg.ring and seg.minStage == st then out[#out + 1] = seg end
 	end
-	local nestMat = "plaster"                                     -- (every kind breaks like Silkmaw 1.0.3's nest)
-	local parts = {"<body tags='silkmawnest nocull' dynamic='false'>"}
-	local activeSegs = {}
-	for _, seg in ipairs(w.nestSegs) do
-		if (only and seg.minStage == st) or (not only and st >= seg.minStage) then
-			local aIdx = #activeSegs + 1
-			activeSegs[aIdx] = seg
-			local glowTag = seg.isGlow and " nestglow" or ""
-			parts[#parts + 1] = string.format(
-				"<voxbox tags='nocull%s sv=%d' material='" .. nestMat .. "' pos='%.3f %.3f %.3f' size='%d %d %d' color='%s'/>",
-				glowTag, aIdx, seg.localPos[1], seg.localPos[2], seg.localPos[3],
-				seg.wVox, seg.hVox, seg.lVox, seg.col
-			)
-		end
+	return out
+end
+
+-- one voxbox per strip (the pack's way; NEST_PAINT = false)
+function wormSpawnSilkBoxes(w, segs)
+	local parts = {"<body tags='silkmawnest' dynamic='false'>"}
+	for idx, seg in ipairs(segs) do
+		parts[#parts + 1] = string.format(
+			"<voxbox tags='%ssv=%d' material='plaster' pos='%.3f %.3f %.3f' size='%d %d %d' color='%s'/>",
+			seg.isGlow and "nestglow " or "", idx, seg.localPos[1], seg.localPos[2], seg.localPos[3], seg.wVox, seg.hVox, seg.lVox, seg.col)
 	end
-	if #activeSegs == 0 then return 0 end
 	parts[#parts + 1] = "</body>"
-	local nestTr = Transform(baseP, Quat())
-	local ents = Spawn(table.concat(parts), nestTr, true)
 	local body = 0
-	for _, e in ipairs(ents or {}) do
+	for _, e in ipairs(Spawn(table.concat(parts), w.nestTr, true) or {}) do
 		if GetEntityType(e) == "body" then
 			body = e
-			SetTag(body, "nocull")
 			SetBodyDynamic(body, false)
-			SetBodyTransform(body, nestTr)
+			SetBodyTransform(body, w.nestTr)
 			for _, sh in ipairs(GetBodyShapes(e)) do
-				SetTag(sh, "nocull")
 				local sIdx = tonumber(GetTagValue(sh, "sv"))
-				if sIdx and activeSegs[sIdx] then
-					SetShapeLocalTransform(sh, activeSegs[sIdx].localTr)
-				end
+				if sIdx and segs[sIdx] then SetShapeLocalTransform(sh, segs[sIdx].localTr) end
 				SetShapeCollisionFilter(sh, WORM_LAYER, 255 - WORM_LAYER)
-				if HasTag(sh, "nestglow") then
-					SetShapeEmissiveScale(sh, 0.24)
-				else
-					SetShapeEmissiveScale(sh, 0.08)
-				end
+				SetShapeEmissiveScale(sh, HasTag(sh, "nestglow") and 0.24 or 0.08)
 				wormNestShapes[sh] = w
 			end
 		end
 	end
 	return body
+end
+
+-- The silk painted into a few shapes per piece (NEST_PAINT): the piece's strips are grouped by their angle round the
+-- nest into sections at most PAINT_SECTION m on any axis (glowing strips apart), and each section is ONE shape
+-- (CreateShape with the silk palette vox/silkpal.vox, plaster rows 105-120) with every strip drawn into it as voxel
+-- lines (SetBrush + DrawShapeLine), as thick and as wide as its box was. ~235 shapes a ring become ~20. Any engine
+-- call failing (pcall) leaves the boxes instead.
+SILK_PAL_FILE = "MOD/vox/silkpal.vox"
+PAINT_SECTION = 6.0           -- m: a painted shape covers at most this on each axis
+PAINT_LIFT = 0.08             -- m per voxel of thickness: a strand's middle above the surface (0.05 left them in the ground)
+SILK_PAL = {                  -- the palette rows (vox/silkpal.vox, made by giantcentipedes/tools/make_silkpal.py)
+	acidica = {105, {{0.97, 0.99, 0.96}, {0.94, 0.97, 0.93}, {0.91, 0.95, 0.90}, {0.88, 0.92, 0.87},
+		{0.85, 0.89, 0.84}, {0.82, 0.87, 0.82}, {0.79, 0.84, 0.79}, {0.76, 0.81, 0.76}}},
+	ignitus = {113, {{0.38, 0.34, 0.31}, {0.32, 0.27, 0.24}, {0.27, 0.22, 0.19}, {0.22, 0.18, 0.15}}},
+	seismica = {117, {{0.56, 0.46, 0.31}, {0.49, 0.40, 0.28}, {0.43, 0.37, 0.29}, {0.36, 0.32, 0.27}}},
+}
+
+-- the palette index nearest a strip's colour ("r g b"), in its kind's rows
+function wormSilkPalIndex(variant, col)
+	local set = SILK_PAL[variant] or SILK_PAL.acidica
+	local r, g, b = string.match(col or "", "([%d%.]+) ([%d%.]+) ([%d%.]+)")
+	r, g, b = tonumber(r) or 0.9, tonumber(g) or 0.9, tonumber(b) or 0.9
+	local best, bd = set[1], 1e9
+	for i, c in ipairs(set[2]) do
+		local d = (c[1] - r) ^ 2 + (c[2] - g) ^ 2 + (c[3] - b) ^ 2
+		if d < bd then best, bd = set[1] + i - 1, d end
+	end
+	return best
+end
+
+local function paintSection(w, body, group, lo, hi, glow)
+	local m = 0.3
+	local ox, oy, oz = math.floor((lo[1] - m) * 10) / 10, math.floor((lo[2] - m) * 10) / 10, math.floor((lo[3] - m) * 10) / 10
+	local nx = math.min(128, math.ceil((hi[1] + m - ox) * 10) + 1)
+	local ny = math.min(128, math.ceil((hi[2] + m - oy) * 10) + 1)
+	local nz = math.min(128, math.ceil((hi[3] + m - oz) * 10) + 1)
+	local sh = CreateShape(body, Transform(Vec(ox, oy, oz)), SILK_PAL_FILE)
+	if not sh or sh == 0 then error("CreateShape failed") end
+	ResizeShape(sh, 0, 0, 0, nx - 1, ny - 1, nz - 1)
+	for _, e in ipairs(group) do
+		local seg, a, b = e[1], e[2], e[3]
+		local th = math.max(1, math.min(2, seg.hVox or 1))
+		local lines = math.max(1, math.ceil((seg.wVox or th) / th))
+		local d = VecSub(b, a)
+		local n = seg.norm or Vec(0, 1, 0)
+		local side = VecCross(n, d)
+		side = VecLength(side) > 1e-4 and VecNormalize(side) or Vec(1, 0, 0)
+		local lift = VecScale(n, PAINT_LIFT * th)
+		SetBrush("cube", th, wormSilkPalIndex(w.variant, seg.col))
+		for k = 1, lines do
+			local off = VecAdd(lift, VecScale(side, (k - (lines + 1) / 2) * 0.1 * th))
+			local p0, p1 = VecAdd(a, off), VecAdd(b, off)
+			DrawShapeLine(sh, (p0[1] - ox) * 10, (p0[2] - oy) * 10, (p0[3] - oz) * 10, (p1[1] - ox) * 10, (p1[2] - oy) * 10, (p1[3] - oz) * 10)
+		end
+	end
+	SetShapeCollisionFilter(sh, WORM_LAYER, 255 - WORM_LAYER)
+	SetShapeEmissiveScale(sh, glow and 0.24 or 0.08)
+	SetTag(sh, "nocull")                  -- (seen in-game: without it the 1-voxel strands faded out past ~15 m and left
+	if glow then SetTag(sh, "nestglow") end   -- only their shadows; a nest is a few dozen shapes now, so it is cheap)
+	wormNestShapes[sh] = w
+end
+
+-- a piece's silk painted into a fresh static body at the nest (0 when it could not be: the boxes are used then)
+function wormPaintSilkBody(w, segs)
+	if not (CreateShape and ResizeShape and SetBrush and DrawShapeLine) or not w.nestTr then return 0 end
+	-- (on the world's 0.1 m voxel grid: at the nest's exact spot the voxels sat across the ground's, and the 1-voxel
+	--  strands half inside the ground came out dark - seen in-game)
+	local tp = w.nestTr.pos
+	local tr = Transform(Vec(math.floor(tp[1] * 10 + 0.5) / 10, math.floor(tp[2] * 10 + 0.5) / 10, math.floor(tp[3] * 10 + 0.5) / 10),
+		w.nestTr.rot)
+	local body = 0
+	for _, e in ipairs(Spawn("<body tags='silkmawnest' dynamic='false'/>", tr, true) or {}) do
+		if GetEntityType(e) == "body" then body = e end
+	end
+	if body == 0 then return 0 end
+	local ok, err = pcall(function()
+		SetBodyDynamic(body, false)
+		SetBodyTransform(body, tr)
+		local c = tr.pos
+		for _, glow in ipairs({false, true}) do
+			local list = {}
+			for _, seg in ipairs(segs) do
+				if (seg.isGlow and true or false) == glow and seg.p0 and seg.p1 then
+					local mid = VecLerp(seg.p0, seg.p1, 0.5)
+					list[#list + 1] = {seg, VecSub(seg.p0, c), VecSub(seg.p1, c), math.atan2(mid[3] - c[3], mid[1] - c[1])}
+				end
+			end
+			table.sort(list, function(x, y) return x[4] < y[4] end)
+			local group, lo, hi = {}, nil, nil
+			for _, e in ipairs(list) do
+				local a, b = e[2], e[3]
+				local slo = Vec(math.min(a[1], b[1]), math.min(a[2], b[2]), math.min(a[3], b[3]))
+				local shi = Vec(math.max(a[1], b[1]), math.max(a[2], b[2]), math.max(a[3], b[3]))
+				if lo then
+					local nlo = Vec(math.min(lo[1], slo[1]), math.min(lo[2], slo[2]), math.min(lo[3], slo[3]))
+					local nhi = Vec(math.max(hi[1], shi[1]), math.max(hi[2], shi[2]), math.max(hi[3], shi[3]))
+					if nhi[1] - nlo[1] > PAINT_SECTION or nhi[2] - nlo[2] > PAINT_SECTION or nhi[3] - nlo[3] > PAINT_SECTION then
+						paintSection(w, body, group, lo, hi, glow)
+						group, lo, hi = {}, nil, nil
+					else
+						lo, hi = nlo, nhi
+					end
+				end
+				if not lo then lo, hi = slo, shi end
+				group[#group + 1] = e
+			end
+			if #group > 0 then paintSection(w, body, group, lo, hi, glow) end
+		end
+	end)
+	if not ok then
+		wormNestPaintError = tostring(err)                    -- (for the TEST panel: why the boxes were used)
+		for _, sh in ipairs(GetBodyShapes(body) or {}) do wormNestShapes[sh] = nil end
+		Delete(body)
+		return 0
+	end
+	return body
+end
+
+-- spawn (or respray) piece `key` from `segs`; returns its body (0: nothing to spawn)
+function wormNestSpawnPiece(w, key, segs)
+	w.nestPieces = w.nestPieces or {}
+	w.nestBodies = w.nestBodies or {}
+	if not segs or #segs == 0 then return 0 end
+	for _, seg in ipairs(segs) do seg.ring = seg.ring or (string.sub(key, 1, 1) == "r") end
+	local body = 0
+	if NEST_PAINT then body = wormPaintSilkBody(w, segs) end
+	if body == 0 then body = wormSpawnSilkBoxes(w, segs) end
+	local piece = w.nestPieces[key] or {}
+	piece.segs, piece.initVox, piece.spawnT = segs, nil, now()
+	if piece.i then w.nestBodies[piece.i] = body else w.nestBodies[#w.nestBodies + 1] = body; piece.i = #w.nestBodies end
+	w.nestPieces[key] = piece
+	w.nestBody = w.nestBodies[1] or 0
+	w.nestIntegT = nil
+	return body
+end
+
+-- the nest's voxels when whole: each piece's count, taken once it has settled (0.3 s after its spawn)
+function wormNestInitVox(w)
+	local total = 0
+	for _, piece in pairs(w.nestPieces or {}) do
+		local b = w.nestBodies and w.nestBodies[piece.i]
+		if not piece.initVox and b and b ~= 0 and IsHandleValid(b) and now() - (piece.spawnT or 0) > 0.3 then
+			piece.initVox = wormBodyVoxelCount(b)
+		end
+		total = total + (piece.initVox or (b and b ~= 0 and IsHandleValid(b) and wormBodyVoxelCount(b) or 0))
+	end
+	return total
 end
 
 -- Finds the nearest floor point around `prefP` that is strictly inside the playable map and suitable for spraying silk
@@ -1357,21 +1615,21 @@ function wormBuildSilkNest(w)
 		w.lair = VecCopy(interiorP)
 		w.nestTr = nestTr
 		w.nestSegs, w.nestSilkNodes, w.nestArteryTips = wormTraceSilkNetwork(baseP, w.variant)
+		w.nestExtent = wormNestExtent(w)
 		w.nestTier = 1
 		w.nestMaxHp = NEST_MAX_HP
 		w.nestHp = NEST_MAX_HP
 		w.mouth = 0.85
 		w.ev.hiss = w.ev.hiss + 1
 
-		local body = wormSpawnNestBody(w, baseP, 1, true)
+		w.nestBodies, w.nestPieces, w.nestGrow = {}, {}, nil
+		local body = wormNestSpawnPiece(w, "s1", wormNestStageSegs(w, 1))
 		w.nestBody = body
-		w.nestBodies = {}
-		if body ~= 0 then w.nestBodies[1] = body end
 		w.nestIntegT = nil
 		w.nestInitVox = math.max(100, wormBodyVoxelCount(body))
 		wormNests[#wormNests + 1] = {
 			pos = interiorP, tr = nestTr, body = body, bodies = w.nestBodies, initVox = w.nestInitVox,
-			owner = w.id, repairing = true, tier = 1, variant = w.variant or "acidica",
+			owner = w.id, repairing = true, tier = 1, variant = w.variant or "acidica", extent = w.nestExtent,
 		}
 		return
 	end
@@ -1387,8 +1645,7 @@ function wormBuildSilkNest(w)
 		local baseP = (w.nestTr and w.nestTr.pos) or VecSub(w.nestPos, Vec(0, 0.45, 0))
 		w.nestBodies = w.nestBodies or {}
 		for st = (w.nestBuildStage or 1) + 1, wantStage do
-			local nb = wormSpawnNestBody(w, baseP, st, true)
-			if nb ~= 0 then w.nestBodies[#w.nestBodies + 1] = nb end
+			wormNestSpawnPiece(w, "s" .. st, wormNestStageSegs(w, st))
 		end
 		w.nestBuildStage = wantStage
 		w.nestBody = w.nestBodies[1] or 0
@@ -1427,15 +1684,23 @@ function wormRepairSilkNest(w)
 	if not w.nestBuilt or not w.nestTr or not w.nestPos then return end
 	-- the silk is sprayed again only when voxels are really gone; a nest that only lost structural HP keeps its
 	-- bodies (a respray is ~370 shapes sent to every client)
-	local vox, ok = wormNestBodiesState(w.nestBodies)
-	if not ok or vox < (w.nestInitVox or 0) then
-		w.nestBodies = w.nestBodies or {}
-		wormNestDeleteBodies(w)
-		local newBody = wormSpawnNestBody(w, w.nestTr.pos, NEST_BUILD_STAGES)
-		if newBody ~= 0 then w.nestBodies[1] = newBody end
-		w.nestBody = newBody
-		w.nestInitVox = math.max(100, wormBodyVoxelCount(newBody))
+	-- (only the pieces that lost silk are sprayed again: the pack deleted and resent the whole nest)
+	wormNestInitVox(w)
+	local resprayed = 0
+	for key, piece in pairs(w.nestPieces or {}) do
+		local b = w.nestBodies[piece.i]
+		local ok = b and b ~= 0 and IsHandleValid(b)
+		if not ok or wormBodyVoxelCount(b) < (piece.initVox or 0) then
+			if ok then
+				for _, sh in ipairs(GetBodyShapes(b) or {}) do wormNestShapes[sh] = nil end
+				Delete(b)
+			end
+			wormNestSpawnPiece(w, key, piece.segs)
+			resprayed = resprayed + 1
+		end
 	end
+	w.nestResprayed = resprayed
+	w.nestInitVox = math.max(100, wormNestInitVox(w))
 	-- (the nest keeps its tier: the respray above puts back every ring it has. The pack set the tier back to 1 here
 	--  while the outer rings stayed, so each repair + visit added a ring past the cap - 3,900 shapes after 12 visits)
 	w.nestMaxHp = NEST_MAX_HP
@@ -1548,9 +1813,10 @@ function wormMatureToAdult(w)
 	w.nestBuildStage = 0
 	w.nestSegs = nil
 	w.nestSilkNodes = nil
+	w.nestExtent = nil
 	w.nestPos = nil
 	w.nestBody = 0
-	w.nestBodies = nil
+	w.nestBodies, w.nestPieces, w.nestGrow = nil, nil, nil
 	w.nestTarget = wormFindDarkNestSite(w, motherNest, ADULT_DISPERSE_MIN, ADULT_DISPERSE_MAX)
 	w.nestStartT = now()
 	w.goal = nil
@@ -2304,13 +2570,14 @@ function wormTriggerNestRebuild(w)
 		if wormNests[i].owner == w.id then table.remove(wormNests, i) end
 	end
 	w.nestBody = 0
-	w.nestBodies = nil
+	w.nestBodies, w.nestPieces, w.nestGrow = nil, nil, nil
 	w.nestBuilt = false
 	w.buildingNest = false
 	w.nestBuildStartT = 0
 	w.nestBuildStage = 0
 	w.nestSegs = nil
 	w.nestSilkNodes = nil
+	w.nestExtent = nil
 	w.nestPos = nil
 	w.nestTr = nil
 	w.visitingNest = false
@@ -3379,7 +3646,7 @@ function wormSense(w)
 					fightRival, fightDist = rw, rd
 				end
 			elseif not rw.baby then
-				local nearMyNest = w.nestPos and dist(rw.pos, w.nestPos) < (NEST_RADIUS * (w.nestTier or 1) + 8.0)
+				local nearMyNest = w.nestPos and dist(rw.pos, w.nestPos) < ((w.nestExtent or NEST_RADIUS) + 8.0)
 				local rivalTargetingMe = (rw.target == "w:" .. tostring(w.id))
 				local engageR = (rw.variant == "machina") and 28.0 or RIVAL_FIGHT_R
 				if (rd < engageR or nearMyNest or rivalTargetingMe) and rd < fightDist then
@@ -4748,6 +5015,8 @@ end
 ----- callbacks -----
 
 function Worm.serverInit()
+	local rings = GetInt("savegame.mod.nestrings")
+	if rings >= 3 and rings <= 10 then NEST_MAX_TIER = rings end
 	wormList = {}
 	wormHitShapes = {}
 	wormNestShapes = {}
@@ -4888,6 +5157,7 @@ function Worm.serverTick(dt)
 	wormTakeApiDamage()
 	wormAcidTick(dt)
 	wormLifecycleTick()
+	for _, w in ipairs(wormList) do if w.nestGrow then wormNestGrowStep(w) end end   -- (rings grow over frames)
 	wormCocoonTick(dt)
 	wormPlayerCocoonTick(dt)
 	wormVlCocoonTick(dt)
